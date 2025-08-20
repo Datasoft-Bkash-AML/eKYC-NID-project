@@ -1,0 +1,9 @@
+{
+  "name": "ocr-python310",
+  "image": "mcr.microsoft.com/devcontainers/python:3.10",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:1": {}
+  },
+  "mounts": ["source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"],
+  "remoteUser": "vscode"
+}

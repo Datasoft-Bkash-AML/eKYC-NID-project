@@ -1,0 +1,15 @@
+opencv-python==4.10.0.84
+pytesseract==0.3.13
+uvicorn==0.32.1
+fastapi==0.115.6
+imutils==0.5.4
+python-multipart==0.0.19
+auto-py-to-exe==2.46.0
+dlib==19.24.6
+numpy==1.26.4
+insightface==0.7.3
+onnxruntime==1.21.0
+slowapi==0.1.9
+pyinstaller==6.13.0
+httpx==0.28.1
+python-jose

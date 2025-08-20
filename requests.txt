@@ -1,0 +1,27 @@
+curl -X 'POST' \
+  'http://localhost:8080/api-auth' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "apiKey": "ds",
+  "baseUrl": "string",
+  "username": "string",
+  "password": "string"
+}'
+
+
+curl -X 'POST' \
+  'http://localhost:8080/process-ocr' \
+  -H 'accept: application/json' \
+  -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NTQ5Nzg5MzMsImVjX2NyZWRlbnRpYWxzX3ZhbGlkIjpmYWxzZX0.WdhV_kHRA1u_Ugp4Uin7VLOA2OuT6F8eGMJUeDiUWuA' \
+  -H 'Content-Type: multipart/form-data' \
+  -F 'front_side=@6b34340c753b37ec28e34b4edc55de2d44428687.png;type=image/png' \
+  -F 'profile=@B1.png;type=image/png'
+
+
+sudo apt-get update
+sudo apt-get install build-essential cmake
+sudo apt-get install libopenblas-dev liblapack-dev
+sudo apt-get install libx11-dev libgtk-3-dev
+
+pip install dlib
