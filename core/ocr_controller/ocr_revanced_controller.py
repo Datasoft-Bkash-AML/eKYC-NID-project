@@ -260,13 +260,17 @@ class OCRProcessor:
         detectImages = [gray, resizedCopyImage, grayNew, enhanced]
         
         try:
-            gray_finalImage,ocrResults = await self.start_ocr_frontSide(resizedImage, detectImages, contours, faceRectangles, show_steps, unique_id)
+            gray_finalImage, ocrResults = await self.start_ocr_frontSide(resizedImage, detectImages, contours, faceRectangles, show_steps, unique_id)
         except Exception as e:
+            # Return more detailed error info for debugging and user feedback
             return {
-                    "success": False,
-                    "message": "Request not successful",
-                    "error": "OCR failed to read the NID card. Please upload a clearer, high-quality image."
+                "success": False,
+                "message": "OCR failed to process the image.",
+                "error": {
+                    "code": 406,
+                    "details": f"OCR failed to read the NID card. Please upload a clearer, high-quality image. Exception: {str(e)}"
                 }
+            }
 
         if show_steps:
             # Draw rectangle around the largest face asynchronously
@@ -506,13 +510,13 @@ class OCRProcessor:
                 # dob_pattern = r'(?:[^\d]?)(\d{1,2}\s+[A-Za-z]{3}\s+(?:\d\s?){4})'
                 dob_pattern = r'\b(0?[1-9]|[12][0-9]|3[01])[\s\-]+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+(\d{4})\b'
                 replacePattern = [(r'[-\s]+', ' '), (r'\s+', ' ')]
-                mainImage, ocrText = await self.repeatetive_process_text_for_nid_no(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", dob_pattern, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
+                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", dob_pattern, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
                 validContourCount += 1
 
             elif name == self.nidFields[5]: # nid
                 nid_pattern = r'\b(?:\d[-\s]?){9}(?:\d)\b|\b(?:\d[-\s]?){12}(?:\d)\b|\b(?:\d[-\s]?){16}(?:\d)\b'
                 replacePattern = [(r'[-\s]+', ''),(r'[\s-]+', '') , (r'\s+', '')]
-                mainImage, ocrText = await self.repeatetive_process_text_for_nid_no(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", nid_pattern, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
+                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", nid_pattern, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
                 validContourCount += 1
 
             if ocrText:
