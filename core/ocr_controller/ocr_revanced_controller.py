@@ -22,17 +22,11 @@ try:
     from PIL import ImageFont, ImageDraw, Image
 except ImportError as e:
     import_log.append(f"PIL import failed: {e}")
-import cv2
-import imutils
-import numpy as np
-import pytesseract
-from PIL import ImageFont, ImageDraw, Image
 import os
 import re
 import asyncio
 import time
 from collections import defaultdict
-
 from utils.custom_helper import format_dob_for_ec
 from .face_matcher_controller import ArcFaceMatcher  # Assuming you have this library
 
@@ -46,7 +40,6 @@ class OCRProcessor:
         parent_folder = os.path.dirname(parent_folder)
         target_folder = os.path.join(parent_folder, "assets")
         self.font_path = os.path.join(target_folder, 'ben.ttf')
-
         # Define the meaningful names for lines
         # self.nidFields = ["bng_name", "eng_name", "father_name", "mother_name", "dob", "nid_num"]
         self.nidFields = ["name", "nameEn", "father", "mother", "dateOfBirth", "nationalId"]
@@ -266,52 +259,14 @@ class OCRProcessor:
         # Start OCR processing
         detectImages = [gray, resizedCopyImage, grayNew, enhanced]
         
-        # Check for import errors or tesseract issues
-        if import_log:
-            tesseract_missing = any('pytesseract' in log or 'tesseract' in log for log in import_log)
-            if tesseract_missing:
-                return {
-                    "success": False,
-                    "message": "Tesseract OCR engine is not installed or not found. Please install Tesseract and ensure it is in your PATH.",
-                    "data": None,
-                    "error": {
-                        "code": 406,
-                        "details": "Tesseract OCR is required for this operation. See the README for installation instructions."
-                    }
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": "OCR engine initialization failed due to missing dependencies.",
-                    "data": None,
-                    "error": {
-                        "code": 406,
-                        "details": f"OCR dependencies failed to load: {'; '.join(import_log)}"
-                    }
-                }
         try:
             gray_finalImage,ocrResults = await self.start_ocr_frontSide(resizedImage, detectImages, contours, faceRectangles, show_steps, unique_id)
         except Exception as e:
-            error_msg = str(e)
-            if 'tesseract is not installed' in error_msg or 'tesseract_cmd' in error_msg or 'No such file or directory' in error_msg:
-                return {
-                    "success": False,
-                    "message": "Tesseract OCR engine is not installed or not found. Please install Tesseract and ensure it is in your PATH.",
-                    "data": None,
-                    "error": {
-                        "code": 406,
-                        "details": "Tesseract OCR is required for this operation. See the README for installation instructions."
-                    }
-                }
             return {
-                "success": False,
-                "message": "OCR engine runtime error",
-                "data": None,
-                "error": {
-                    "code": 406,
-                    "details": f"OCR failed to run: {error_msg}"
+                    "success": False,
+                    "message": "Request not successful",
+                    "error": "OCR failed to read the NID card. Please upload a clearer, high-quality image."
                 }
-            }
 
         if show_steps:
             # Draw rectangle around the largest face asynchronously
@@ -551,13 +506,13 @@ class OCRProcessor:
                 # dob_pattern = r'(?:[^\d]?)(\d{1,2}\s+[A-Za-z]{3}\s+(?:\d\s?){4})'
                 dob_pattern = r'\b(0?[1-9]|[12][0-9]|3[01])[\s\-]+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+(\d{4})\b'
                 replacePattern = [(r'[-\s]+', ' '), (r'\s+', ' ')]
-                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", dob_pattern, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
+                mainImage, ocrText = await self.repeatetive_process_text_for_nid_no(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", dob_pattern, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
                 validContourCount += 1
 
             elif name == self.nidFields[5]: # nid
                 nid_pattern = r'\b(?:\d[-\s]?){9}(?:\d)\b|\b(?:\d[-\s]?){12}(?:\d)\b|\b(?:\d[-\s]?){16}(?:\d)\b'
                 replacePattern = [(r'[-\s]+', ''),(r'[\s-]+', '') , (r'\s+', '')]
-                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", nid_pattern, replacePattern, r"--oem 1 --psm 7")
+                mainImage, ocrText = await self.repeatetive_process_text_for_nid_no(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", nid_pattern, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
                 validContourCount += 1
 
             if ocrText:
@@ -700,6 +655,7 @@ class OCRProcessor:
                 for pattern, replacement in replacePattern:
                     ocredtext = re.sub(pattern, replacement, ocredtext, flags=re.IGNORECASE)
                     # ocredtext = re.sub(r'^[^\u0980-\u09FFa-zA-Z0-9]+|[^\u0980-\u09FFa-zA-Z0-9]+$', '', ocredtext)
+                    
 
             if len(ocredtext)>3:
                 break

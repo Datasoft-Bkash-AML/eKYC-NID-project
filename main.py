@@ -317,7 +317,6 @@ async def handle_ocr_request(request: Request, profile: UploadFile, front_side: 
     x_forwarded_for = request.headers.get('X-Forwarded-For')
     client_ip = x_forwarded_for.split(',')[0] if x_forwarded_for else request.client.host
     print(f"Executing New Request, ID: {unique_id}, From IP: {client_ip}")
-    print(f"Initializing OCR at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}") 
     
     # Create OCR task(s)
     tasks = [
@@ -336,7 +335,6 @@ async def handle_ocr_request(request: Request, profile: UploadFile, front_side: 
 
     response["requestId"] = unique_id
     await hit_counter.log_hit(result)
-    print(f"Response at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}") 
     return response
 
 @protected_router.post("/process-ocr", tags=["OCR API's"])
@@ -350,8 +348,24 @@ async def process_ocr_only(
     result = await handle_ocr_request(request, profile, front_side)
     if result.get("nid_data"):
         return APIResponse.success(data=result)
-    else:
-        return APIResponse.error(result["message"], 406 ,result["error"])
+    # Enhanced error detection and logging
+    error_message = result.get("message", "OCR failed. Unknown error.")
+    error_details = result.get("error", None)
+    # Log the error for debugging
+    print(f"[OCR ERROR] /process-ocr failed: message={error_message}, details={error_details}")
+    # Try to provide more specific error messages
+    if error_details:
+        if isinstance(error_details, dict):
+            details_str = error_details.get("details", str(error_details))
+        else:
+            details_str = str(error_details)
+        if "tesseract" in details_str.lower() and "ben.traineddata" in details_str.lower():
+            error_message = "Bengali language data (ben.traineddata) for Tesseract is missing. Please install it as per the README."
+        elif "tesseract" in details_str.lower():
+            error_message = "Tesseract OCR engine is not installed or not found. Please install Tesseract and ensure it is in your PATH."
+        elif "forbidden" in details_str.lower() or "403" in details_str:
+            error_message = "You are not authorized to access this resource. Please check your credentials or permissions."
+    return APIResponse.error(error_message, 406, error_details)
 
 
 @protected_router.post("/process-ocr-with-ec", tags=["OCR API's"])

@@ -7,23 +7,31 @@ import os
 import re
 import asyncio
 import time
-from datetime import datetime
+from collections import defaultdict
+
+from utils.custom_helper import format_dob_for_ec
 from .face_matcher_controller import ArcFaceMatcher  # Assuming you have this library
 
 faceMatcher = ArcFaceMatcher(threshold=80)
 
 class OCRProcessor:
     def __init__(self):
+        # current_folder = os.getcwd()
         current_folder = os.path.dirname(os.path.abspath(__file__))  # Get the current script's directory
-        parent_folder = os.path.dirname(current_folder)  # Go one level up
+        parent_folder = os.path.dirname(current_folder)
+        parent_folder = os.path.dirname(parent_folder)
         target_folder = os.path.join(parent_folder, "assets")
         self.font_path = os.path.join(target_folder, 'ben.ttf')
 
-    async def estimate_image_quality(self, image_path: str) -> dict:
+        # Define the meaningful names for lines
+        # self.nidFields = ["bng_name", "eng_name", "father_name", "mother_name", "dob", "nid_num"]
+        self.nidFields = ["name", "nameEn", "father", "mother", "dateOfBirth", "nationalId"]
+
+    async def estimate_image_quality(self, image_path: str, unique_id: str, high_accuracy: bool, is_nid_dob_extractable: bool) -> dict:
         image = cv2.imread(image_path)
         if image is None:
             return {"message": "Failed to load image"}
-
+    
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         height, width = gray.shape[:2]
@@ -53,11 +61,12 @@ class OCRProcessor:
             degrees = [abs(np.rad2deg(theta) - 90) for theta in angles]
             skew_angle = np.median(degrees) if degrees else 0
 
+        requiredTextRegionScore = 1000 if high_accuracy else 500
         # --- Scoring System ---
         sharpness_score = 1 if sharpness > 1000 else 0.3
         contrast_score = 1 if contrast > 50 else 0.5
         brightness_score = 1 if 60 < brightness < 150 else 0.3
-        text_region_score = 1 if text_like_regions > 1000 else 0.5
+        text_region_score = 1 if text_like_regions > requiredTextRegionScore else 0
         glare_score = 1 if glare_ratio < 0.05 else 0.2
         skew_score = 1 if skew_angle < 5 else 0.4
 
@@ -70,13 +79,25 @@ class OCRProcessor:
             skew_score
         ) / 6 * 100
 
-        if score >= 90:
-            message = "Image is excellent for OCR"
-        elif score >= 75:
-            message = "Image is acceptable for OCR"
-        else:
-            message = "Image may cause issues with OCR"
+        acceptableScore = 100
 
+        # if score >= 90:
+        #     message = "Image is excellent for OCR"
+        if score >= 70 and text_region_score == 1:
+            message = "Looks good! This image is suitable for OCR."
+        elif text_region_score == 0:
+            acceptableScore = 0
+            message = "Text quality is too low for OCR. Please provide a clearer image."
+        else:
+            acceptableScore = 50
+            message = "Image quality may affect OCR accuracy."
+
+        if is_nid_dob_extractable:
+            result = await self.processFrontSide(image_path, unique_id, image_path, True)
+            if(result and result['nid_data'] and (len(result['nid_data'][self.nidFields[4]])<10 or len(result['nid_data'][self.nidFields[5]])<10)):
+                message="Unable to extract text from the image. Please upload a clearer and higher-quality image."
+                acceptableScore=-100
+            
         return {
             "sharpness": round(sharpness, 2),
             "contrast": round(contrast, 2),
@@ -86,8 +107,9 @@ class OCRProcessor:
             "skew_angle_deg": round(skew_angle, 2),
             "score": round(score, 2),
             "message": message,
-            "acceptableQuality": True if score >= 75 else False,
+            "acceptableScore": acceptableScore
         }
+        
 
     async def letsStart(self, image_path, unique_id, image_side, profile_path, show_steps=True):
         start_time = time.time()
@@ -107,30 +129,19 @@ class OCRProcessor:
         if nidImage is None:
             raise FileNotFoundError(f"Image not found at {image_path}")
 
-        resizedImage = await asyncio.to_thread(imutils.resize, nidImage, height=600)
+        resizedImage = await asyncio.to_thread(imutils.resize, nidImage, height=1000)
         
         faceMatchingResult = await faceMatcher.compare(profileImage,resizedImage)
-
-        # faceMatchingResult = {
-        #         "is_face_matched": False,
-        #         "face_matched_score": 0.0,
-        #         "face_matched_threshold": 0.0,
-        #         "reason": "Face not detected",
-        #         "face1": None,
-        #         "face2": None,
-        #         "face1_rect": None,
-        #         "face2_rect": None
-        #     }
 
         resizedCopyImage = resizedImage.copy()
 
         gray = await asyncio.to_thread(cv2.cvtColor, resizedCopyImage, cv2.COLOR_BGR2GRAY)
-
+        
         # Face detection
         faceRectangles = (0, 0, 0, 0)
         
-        if faceMatchingResult.get("face2_rect") is not None:
-            x, y, w, h = faceMatchingResult.get("face2_rect")
+        if faceMatchingResult.get("nidFace_rect") is not None:
+            x, y, w, h = faceMatchingResult.get("nidFace_rect")
 
             # Add extra space to include more context around the face
             extra_space = int(w * 0.15)
@@ -144,15 +155,20 @@ class OCRProcessor:
             face = resizedImage[y_new:h_new, x_new:w_new]
             face_height, _ = face.shape[:2]
 
-            combined_img = await self.process_images_into_one(face, [faceMatchingResult.get("face1"),faceMatchingResult.get("face2")])  
-            combined_img = await self.write_text_to_image(
-                combined_img, extra_space, 0, 0, 0, f"Result (Matched-{faceMatchingResult['is_face_matched']})"
-            )
-            combined_img = await self.write_text_to_image(
-                combined_img, extra_space, face_height-extra_space, 0, 0, f"(Score-{faceMatchingResult['face_matched_score']}) (TScore-{faceMatchingResult['face_matched_threshold']})"
-            )
-            output_path = os.path.join(f"./history/{unique_id}/FrontSide", f"FrontSide.Faces.jpg")
-            await asyncio.to_thread(cv2.imwrite, output_path, combined_img)
+            if show_steps:
+                if faceMatchingResult.get("profileFace") is not None and faceMatchingResult.get("profileFace").any():
+                    combined_img = await self.process_images_into_one(face, [faceMatchingResult.get("profileFace"),faceMatchingResult.get("nidFace")])  
+                else:
+                    combined_img = await self.process_images_into_one(face, [faceMatchingResult.get("nidFace")])  
+
+                combined_img = await self.write_text_to_image(
+                    combined_img, extra_space, 0, 0, 0, f"Result (Matched-{faceMatchingResult['is_face_matched']})"
+                )
+                combined_img = await self.write_text_to_image(
+                    combined_img, extra_space, face_height-extra_space, 0, 0, f"(Score-{faceMatchingResult['face_matched_score']}) (TScore-{faceMatchingResult['face_matched_threshold']})"
+                )
+                output_path = os.path.join(f"./history/{unique_id}/FrontSide", f"FrontSide.Faces.jpg")
+                await asyncio.to_thread(cv2.imwrite, output_path, combined_img)
 
         # Enhance contrast and brightness
         alpha = 1.7
@@ -200,7 +216,7 @@ class OCRProcessor:
         for contour in contours:
             area = await asyncio.to_thread(cv2.contourArea, contour)
 
-            if area < 1000:  # Apply your threshold condition
+            if area < 1500:  # Apply your threshold condition
                 # Asynchronously draw each contour on the image
                 tasks.append(asyncio.to_thread(cv2.drawContours, threshNew, [contour], -1, (0, 0, 0), thickness=cv2.FILLED))
 
@@ -224,131 +240,50 @@ class OCRProcessor:
         contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
 
         # Start OCR processing
-        detectImages = [enhanced, gray, grayNew, resizedCopyImage]
-        gray_finalImage,ocrResults = await self.start_ocr_frontSide(resizedImage, detectImages, contours, faceRectangles, show_steps, unique_id)
-
-        for key, value in ocrResults.items():
-            if(key=='dob' and value):
-                # Valid dates: 01 JAN 2024, 31 DEC 2023
-                # dob_pattern = r'O?\d{1,2}\s[A-Za-z]{3}\s\d{4}'
-                dob_pattern = r'O?\d{1,2}\s[A-Za-z]{3}\s(?:\d\s?){4}'
-
-                def clean_date(date_str):
-                    parts = date_str.split()
-                    if len(parts) == 4:  # e.g. ['01', 'JAN', '2', '024']
-                        parts[2] = parts[2] + parts[3]
-                        parts = parts[:3]
-                    elif len(parts) == 5:  # e.g. ['01', 'JAN', '2', '0', '24']
-                        parts[2] = parts[2] + parts[3] + parts[4]
-                        parts = parts[:3]
-                    return " ".join(parts)
-
-                def validate_date(date_str):
-                    # Check if the format matches "DD MMM YYYY"
-                    if re.match(dob_pattern, date_str):
-                        try:
-                            # Try to parse the date and check if it's valid
-                            datetime.strptime(date_str, "%d %b %Y")
-                            return True
-                        except ValueError:
-                            return False  # Date is invalid
-                    else:
-                        return False  # Format is incorrect
-                # Define patterns
-
-                benTexts = re.search(dob_pattern, value, re.IGNORECASE)
-                value = benTexts.group(0) if benTexts else value
-                value = clean_date(value)
-                value = value if validate_date(value) else None 
-                ocrResults[key] = value
-                # Append OCR results
-
-            elif(key=='nid_num' and value):
-                # Valid numbers: 123 456 7890, 123-456-7890, 1234567890
-
-                # Define patterns
-                ten_digits_pattern = r'\b(\d{3}[-\s]?\d{3}[-\s]?\d{4})\b'
-
-                benTexts = re.search(ten_digits_pattern, value, re.IGNORECASE)
-                value = benTexts.group(0) if benTexts else value
-
-                # Remove all characters except
-                value = re.sub(r'(?<!\w)T(?!\w)', '', value)
-                value = re.sub(r'[^0-9T]', '', value)
-
-                # Replace T with 7
-                ocrResults[key] = value.replace('T', '7')
-            
-            # ["bng_name", "eng_name", "father_name", "mother_name", "dob", "nid_num"]
-            elif(key=='eng_name' and value):
-                # Define patterns
-                # Step 1: Remove Bengali prefix if present
-                value = re.sub(r'^\s*Name\s*[:：]?\s*', '', value)
-
-                # Step 2: Keep only English letters (both cases), dots, and spaces
-                value = re.sub(r'[^a-zA-Z\s\.]', '', value)
-
-                # Normalize multiple spaces
-                value = re.sub(r'\s+', ' ', value)
-
-                # Assign cleaned value to OCR results
-                ocrResults[key] = value.strip()
-                
-            elif(key=='father_name' and value):
-                # Define patterns
-                # Step 1: Remove Bengali prefix if present
-                value = re.sub(r'^\s*পিতা\s*[:：]?\s*', '', value)
-
-                # Optional: Further clean up — keeping only Bengali letters, dots, and spaces
-                value = re.sub(r'[^\u0980-\u09FF\s\.]', '', value)
-
-                # Assign cleaned value to OCR results
-                ocrResults[key] = value.strip()
-
-            elif(key=='mother_name' and value):
-                # Define patterns
-                # Step 1: Remove Bengali prefix if present
-                value = re.sub(r'^\s*মাতা\s*[:：]?\s*', '', value)
-
-                # Optional: Further clean up — keeping only Bengali letters, dots, and spaces
-                value = re.sub(r'[^\u0980-\u09FF\s\.]', '', value)
-
-                # Assign cleaned value to OCR results
-                ocrResults[key] = value.strip()
-                
-            elif value:
-                ocrResults[key] = re.sub(r'\d', '', value)
-
-            # Remove leading and trailing spaces
-            ocrResults[key] = ocrResults[key].strip() if ocrResults[key] else ocrResults[key]
-
-        # if faceDetected:
-        #     _, buffer = cv2.imencode('.jpg', face)
-        #     base64_image = base64.b64encode(buffer).decode('utf-8')
-        #     ocrResults['nid_face'] = base64_image
+        detectImages = [gray, resizedCopyImage, grayNew, enhanced]
         
+        try:
+            gray_finalImage,ocrResults = await self.start_ocr_frontSide(resizedImage, detectImages, contours, faceRectangles, show_steps, unique_id)
+        except Exception as e:
+            return {
+                    "success": False,
+                    "message": "Request not successful",
+                    "error": "OCR failed to read the NID card. Please upload a clearer, high-quality image."
+                }
+
         if show_steps:
             # Draw rectangle around the largest face asynchronously
-            (x_f, y_f, w_f, h_f) = faceRectangles
-            await asyncio.to_thread(
-                cv2.rectangle, gray_finalImage, (x_f, y_f), (w_f, h_f), (0, 255, 0), 2
-            )
+            if faceRectangles != (0, 0, 0, 0):
+                (x_f, y_f, w_f, h_f) = faceRectangles
+                await asyncio.to_thread(
+                    cv2.rectangle, gray_finalImage, (x_f, y_f), (w_f, h_f), (0, 255, 0), 2
+                )
             # detectImages = detectImages + [close, gray_finalImage, face]
-            detectImages = detectImages + [close, gray_finalImage]
+            detectImages = detectImages + [blackhatNew, gradXNew, threshNew, close, gray_finalImage]
+            # detectImages = detectImages[:3] + [blackhatNew, gradXNew, threshNew, close, gray_finalImage]
+            # detectImages = detectImages[:3] + [gray_finalImage]
             
             combined_img = await self.process_images_into_one(resizedImage, detectImages)  
             output_path = os.path.join(f"./history/{unique_id}/FrontSide", f"FrontSide.Processed.jpg")
             await asyncio.to_thread(cv2.imwrite, output_path, combined_img)
         
-        ocrResults['is_face_matched'] = faceMatchingResult['is_face_matched']
-        ocrResults['face_matched_score'] = faceMatchingResult['face_matched_score']
-        ocrResults['face_matched_threshold'] = faceMatchingResult['face_matched_threshold']
+        if "face_data" not in ocrResults:
+                ocrResults["face_data"] = {}
+
+        for field in self.nidFields:
+            if field not in ocrResults['nid_data'] or ocrResults['nid_data'][field] is None:
+                ocrResults['nid_data'][field] = ""
+                
+        ocrResults['face_data']['is_face_matched'] = faceMatchingResult['is_face_matched']
+        ocrResults['face_data']['face_matched_score'] = faceMatchingResult['face_matched_score']
+        ocrResults['face_data']['face_matched_threshold'] = faceMatchingResult['face_matched_threshold']
         
         return ocrResults
 
     async def start_ocr_frontSide(self, mainImage, detectImages, contours, faceRectangles, show_steps, unique_id):
 
             image_side = "FrontSide"
+            extra_space = 12
             x1, y1, x2, y2 = faceRectangles
             avgH, validContour = 0, 0
             first_contour, last_contour, max_width = None, None, 0
@@ -369,24 +304,22 @@ class OCRProcessor:
                 aspect_ratio = w / float(h)
                 area = cv2.contourArea(contour)
                 
-                if 1.5 < aspect_ratio and 1200 < area < 30000 and (x2-(x2/4)) < x and (y1-h)<y:
+                if 1.5 < aspect_ratio and 1500 < area < 35000 and (x2-(x2/4)) < x and (y1-h)<y:
                     # print(f"Countour {index} values - x: {x}, y: {y}, w: {w}, h: {h}, area: {area} -> Accepted")
                     
-                    if w > max_width:
-                        max_width = w
-                        
+                    # if w > max_width:
+                    #     max_width = w
+
                     avgH += h
                     validContour += 1
                     valid_contours.append(contour)
                     # Set first contour if not already set
                     if first_contour is None:
-                        first_contour = (x, y, w, h)
+                        first_contour = (x, y+abs(int(h/3)), w, h)
+                        # first_contour = (x, y, w, h)
 
                     # Always update the last contour
-                    last_contour = (x, y, w, h)
-                
-                # else:
-                #     print(f"Countour {index} values - x: {x}, y: {y}, w: {w}, h: {h}, area: {area} -> Rejected")
+                    last_contour = (x, y-abs(int(h/3)), w, h)
                 
             line_positions = {}
             
@@ -400,9 +333,6 @@ class OCRProcessor:
                 distance = abs((last_y + last_h) - (first_y))
 
                 step_size = distance // 5
-
-                # Define the meaningful names for lines
-                names = ["bng_name", "eng_name", "father_name", "mother_name", "dob", "nid_num"]
                 
                 x_line = int(mainImage.shape[1]/1.6)
                 for i in range(0, 6):
@@ -410,13 +340,13 @@ class OCRProcessor:
                     if show_steps:
                         cv2.line(mainImage, (x_line, y_position), (mainImage.shape[1], y_position), (0, 0, 255), 1)
                         cv2.putText(
-                            mainImage,f"{names[i]}-{y_position}",(mainImage.shape[1]-150, y_position - 5),cv2.FONT_HERSHEY_SIMPLEX,
+                            mainImage,f"{self.nidFields[i]}-{y_position}",(mainImage.shape[1]-150, y_position - 5),cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,  # Font scale
                             (0, 0, 255),  # Font color (green)
                             1,  # Thickness
                             cv2.LINE_AA  # Line type
                         )
-                    line_positions[names[i]] = y_position
+                    line_positions[self.nidFields[i]] = y_position
 
 
             avgH = avgH / validContour if validContour > 0 else 0
@@ -425,34 +355,167 @@ class OCRProcessor:
                 mainImage, 10, 30, 0, 0, f"Details (avgH-{avgH}) (validContour-{validContour})"
             )
 
-            ocrResults = []
-            validContour = 0
+            validContourCount = 0
+            validContoursGroup = []
 
             for i, contour in enumerate(valid_contours):
                 x, y, w, h = cv2.boundingRect(contour)
                 
-                w = max_width
+                # possible_width = abs(int((img_width)*0.80))
+                # if possible_width > x and possible_width > w:
+                #     w = possible_width-x
 
+                # if h > (avgH * 1.6):
+                #     h = h // 2
+                #     validContoursGroup.append((x , y, w, h))
+                #     validContourCount += 1
+
+                #     validContoursGroup.append((x , y+h+extra_space, w, h))
+                #     validContourCount += 1
+                # else:
+                #     validContoursGroup.append((x , y, w, h))
+                #     validContourCount += 1
                 if h > (avgH * 1.6):
                     h = h // 2
-                    mainImage, ocrResult,detectContour = await self.process_text(mainImage, detectImages, x , y, w, h, validContour,unique_id,image_side, show_steps)
-                    if ocrResult:
-                        ocrResults.append((validContour, ocrResult, detectContour))
-                    validContour += 1
+                    validContoursGroup.append((x , y-extra_space, w, h+extra_space))
+                    validContourCount += 1
 
-                    mainImage, ocrResult, detectContour = await self.process_text(mainImage, detectImages, x , y + h , w , h, validContour,unique_id,image_side, show_steps)
-                    if ocrResult:
-                        ocrResults.append((validContour, ocrResult, detectContour))
-                    validContour += 1
+                    validContoursGroup.append((x , y+h-extra_space, w, h+extra_space))
+                    validContourCount += 1
                 else:
-                    mainImage, ocrResult, detectContour = await self.process_text(mainImage, detectImages, x , y , w , h, validContour,unique_id,image_side,show_steps)
-                    if ocrResult:
-                        ocrResults.append((validContour, ocrResult, detectContour))
-                    validContour += 1
-                    
-            intersections = await self.find_intersections_async(line_positions, ocrResults)
+                    validContoursGroup.append((x , y-extra_space, w, h+extra_space))
+                    validContourCount += 1
 
-            return mainImage , intersections
+            # Final grouped result
+            line_to_contours = defaultdict(list)
+
+            for _, (x, y, w, h) in enumerate(validContoursGroup):
+                
+                x = x - extra_space 
+                y = y - extra_space 
+                w = w + (3*extra_space) 
+                h = h + (2*extra_space)
+
+                bottom = y + h
+
+                for name, line_y in line_positions.items():
+                    if y <= line_y <= bottom:
+                        line_to_contours[name].append((x, y, w, h))
+
+            # merging contours
+            for name in self.nidFields:
+                boxes = line_to_contours.get(name, [])
+
+                if not boxes:
+                    continue
+
+                x_min = min(x for x, y, w, h in boxes)
+                y_min = min(y for x, y, w, h in boxes)
+                x_max = max(x + w for x, y, w, h in boxes)
+                y_max = max(y + h for x, y, w, h in boxes)
+
+                merged_x = x_min
+                merged_y = y_min
+                merged_w = x_max - x_min
+                merged_h = y_max - y_min
+
+                # Replace the list of boxes with a single merged box
+                line_to_contours[name] = (merged_x, merged_y, merged_w, merged_h)
+
+            mainImage, ocrResults = await self.continue_ocr_frontside(mainImage, line_to_contours,detectImages,unique_id, image_side, show_steps)
+                    
+            return mainImage , ocrResults
+
+
+    async def continue_ocr_frontside(self, mainImage, line_to_contours, detectImages, unique_id, image_side, show_steps):
+        ocrResults = {}
+        validContourCount, min_x = 0 , 0
+        
+        # Calculate average x for first 4 items
+        selected_fields = {
+            name: (x, y, w, h)
+            for name, (x, y, w, h) in line_to_contours.items()
+            if name in [self.nidFields[0],self.nidFields[1],self.nidFields[2],self.nidFields[3]]
+        }
+
+        if selected_fields:
+            min_x = min(x for x, y, w, h in selected_fields.values())
+            
+        # First, find the maximum width among the target fields
+        max_w = max(
+            w for name, (x, y, w, h) in line_to_contours.items()
+            if name in [self.nidFields[0], self.nidFields[1], self.nidFields[2], self.nidFields[3]]
+        )
+
+        _, img_width = mainImage.shape[:2]
+
+        for name, (x, y, w, h) in line_to_contours.items():
+            # if min_x <= x and name in [self.nidFields[0],self.nidFields[1],self.nidFields[2],self.nidFields[3]]:
+            if name in [self.nidFields[0],self.nidFields[1],self.nidFields[2],self.nidFields[3]]:
+                x = min_x
+                w = max_w
+
+            if name in [self.nidFields[4],self.nidFields[5]]:
+                # temp_width = abs(int((w)*0.30)) + w
+                # if (temp_width + x) <= img_width:
+                #     w = temp_width
+                temp_width = abs(int((img_width)*0.90))
+                if (w + x) <= temp_width:
+                    w = temp_width - x
+                
+            ocrText = None
+
+            if name == self.nidFields[0]: # bng_name
+                replacePattern = [(r'[^\u0980-\u09FF\s\.]', ''), (r'^\s*নাম\s*[:：]?\s*', '')]
+                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "ben", False, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
+                validContourCount += 1
+            
+            elif name == self.nidFields[1]: # eng_name
+                replacePattern = [(r'[^a-zA-Z\s\.]', ''), (r'.*?\bName\b\s*[:：]?\s*', ''), (r'\bmo\.\s*', 'MD. ')]
+                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng", False, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
+                validContourCount += 1
+
+            elif name == self.nidFields[2]: # father_name
+                replacePattern = [(r'[^\u0980-\u09FF\s\.]', ''), (r'^\s*পিতা\s*[:：]?\s*', '')]
+                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "ben", False, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
+                validContourCount += 1
+            
+            elif name == self.nidFields[3]: # mother_name
+                replacePattern = [(r'[^\u0980-\u09FF\s\.]', ''), (r'^\s*মাতা\s*[:：]?\s*', ''), ]
+                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "ben", False, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
+                validContourCount += 1
+
+            elif name == self.nidFields[4]: # dob
+                # dob_pattern = r'(?:[^\d]?)(\d{1,2}\s+[A-Za-z]{3}\s+(?:\d\s?){4})'
+                dob_pattern = r'\b(0?[1-9]|[12][0-9]|3[01])[\s\-]+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+(\d{4})\b'
+                replacePattern = [(r'[-\s]+', ' '), (r'\s+', ' ')]
+                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", dob_pattern, replacePattern, r"--oem 1 --psm 7 -c preserve_interword_spaces=1")
+                validContourCount += 1
+
+            elif name == self.nidFields[5]: # nid
+                nid_pattern = r'\b(?:\d[-\s]?){9}(?:\d)\b|\b(?:\d[-\s]?){12}(?:\d)\b|\b(?:\d[-\s]?){16}(?:\d)\b'
+                replacePattern = [(r'[-\s]+', ''),(r'[\s-]+', '') , (r'\s+', '')]
+                mainImage, ocrText = await self.extract_text(mainImage, detectImages, (x , y, w, h), name, unique_id,image_side, show_steps, "eng+digits", nid_pattern, replacePattern, r"--oem 1 --psm 7")
+                validContourCount += 1
+
+            if ocrText:
+                # # Remove special characters but allow spaces within the text
+                # ocrText = re.sub(r'[^a-zA-Z0-9\u0980-\u09FF ]', '', ocrText)
+                # Remove spaces from the beginning and end
+                ocrText = ocrText.strip()
+
+                if name == self.nidFields[4]: # dob
+                    ocrText = format_dob_for_ec(ocrText)
+            else:
+                ocrText = ''
+
+            if "nid_data" not in ocrResults:
+                ocrResults["nid_data"] = {}
+
+            ocrResults["nid_data"][name] = ocrText
+
+        return mainImage, ocrResults
+
 
     async def process_images_into_one(self, image, detectImages):
         processed_images = []
@@ -494,37 +557,6 @@ class OCRProcessor:
         
         return final_combined 
 
-    async def find_intersections_async(self, line_positions, ocrResults):
-        intersections = {key: [] for key in line_positions.keys()}
-        
-        for line_name, y_pos in line_positions.items():
-            for contour in ocrResults:
-                _, ocr_text, (x, y, w, h) = contour
-                if y <= y_pos <= y + h or y-5 <= y_pos <= y + h:
-                    intersections[line_name].append((ocr_text, x))
-        
-        # Merge OCR results if there are more than one for a line
-        for line_name, ocr_texts in intersections.items():
-            if len(ocr_texts) > 1:
-                # Sort by x position
-                ocr_texts.sort(key=lambda item: item[1])
-                # Merge texts
-                merged_text = ' '.join([text for text, _ in ocr_texts])
-                intersections[line_name] = merged_text
-            else:
-                intersections[line_name] = ocr_texts[0][0] if ocr_texts else None
-
-        # Remove special characters from all values and ensure spaces are not at the beginning or end
-        for key in intersections:
-            if intersections[key]:
-                # Remove special characters but allow spaces within the text
-                cleaned_value = re.sub(r'[^a-zA-Z0-9\u0980-\u09FF ]', '', intersections[key])
-                # Remove spaces from the beginning and end
-                cleaned_value = cleaned_value.strip()
-                intersections[key] = cleaned_value
-
-        return intersections
-    
     async def image_sharpener(self, image):
         # Convert to grayscale
         # Ensure the image is 2D (grayscale)
@@ -568,20 +600,109 @@ class OCRProcessor:
 
         return max_text
     
+    async def extract_text(self, finalImage, detectImages, box, name, unique_id, image_side, show_steps, lang="ben+eng", regexPatten=False, replacePattern=[], config="--oem 1 --psm 7"):
+        icount = 0
+        ocredtext = ''
+        (x, y, w, h) = box
+
+        while icount < len(detectImages):
+            detectImage = detectImages[icount]
+                    
+            # Crop the region of interest asynchronously
+            cropped = detectImage[y:y + h, x:x + w]
+            cropped = await self.downscale_image_async(cropped, 0.5)
+            # cropped_downscaled = await self.downscale_image_async(cropped, 0.7)
+            if show_steps:
+                await asyncio.to_thread(cv2.imwrite, os.path.join(f"./history/{unique_id}/{image_side}", f"{name}_TC{icount}.jpg"), cropped)
+
+
+            # Perform OCR asynchronously
+            ocredtext = await asyncio.to_thread(
+                pytesseract.image_to_string, cropped,  lang=lang , config=config
+                # pytesseract.image_to_string, cropped,  lang=lang , config=r'--oem 1 --psm 7'
+            )
+            ocredtext = ocredtext.strip()
+            ocredtext = ocredtext.strip().replace("\n", "")
+
+            if regexPatten :
+                match = re.search(regexPatten, ocredtext, re.IGNORECASE)
+                if match:
+                    if match.lastgroup == 1:  # Check if group(1) exists
+                        ocredtext = match.group(1)
+                    else:
+                        ocredtext = match.group(0)
+                else:
+                    ocredtext = ''
+
+            if len(replacePattern)>0:
+                for pattern, replacement in replacePattern:
+                    ocredtext = re.sub(pattern, replacement, ocredtext, flags=re.IGNORECASE)
+                    # ocredtext = re.sub(r'^[^\u0980-\u09FFa-zA-Z0-9]+|[^\u0980-\u09FFa-zA-Z0-9]+$', '', ocredtext)
+
+            if len(ocredtext)>3:
+                break
+            else:
+                icount += 1
+
+            # Tried last time once by sharpening the image if no text detected
+            if (icount == len(detectImages)) and len(ocredtext)<4:
+                sharped = await self.image_sharpener(cropped)
+                sharped = await self.downscale_image_async(sharped, 0.5)
+                if show_steps:
+                    await asyncio.to_thread(cv2.imwrite, os.path.join(f"./history/{unique_id}/{image_side}", f"{name}_TC{icount+1}.jpg"), sharped)
+
+                # Perform OCR asynchronously
+                # --oem 1: Uses LSTM OCR engine (good for most modern use cases)
+                # --psm 7: Treats the image as a single text line (good for cropped fields like names)
+                
+                ocredtext = await asyncio.to_thread(
+                    pytesseract.image_to_string, sharped,  lang=lang , config=r'--oem 1 --psm 7'
+                )
+                ocredtext = ocredtext.strip()
+                ocredtext = ocredtext.replace("\n", "")
+
+                if regexPatten :
+                    match = re.search(regexPatten, ocredtext, re.IGNORECASE)
+                    if match:
+                        if match.lastgroup == 1:  # Check if group(1) exists
+                            ocredtext = match.group(1)
+                        else:
+                            ocredtext = match.group(0)
+                    else:
+                        ocredtext = ''
+
+        # ocredtext = re.sub(r'^\s*[A-Za-z]+\s*[:：]?\s*', '', ocredtext)
+
+        finalImage = await self.write_text_to_image(
+            finalImage, x, y, w, h, f"{ocredtext} ({name}) (TC-{icount}) (H-{h}) (P-{x},{y},{w},{h})"
+        )
+
+        if len(ocredtext)<4:
+            return finalImage, False
+
+        return finalImage, ocredtext
+    
+
+    async def downscale_image_async(self, img, scale_factor=0.5):
+        def resize_image():
+            height, width = img.shape[:2]
+            new_size = (int(width * scale_factor), int(height * scale_factor))
+            return cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)  # Best for downscaling
+
+        return await asyncio.to_thread(resize_image)
+
     async def process_text(self, finalImage, detectImages, x, y, w, h, validContourNo,unique_id,image_side,show_steps, lang="ben+eng", ignoreFilter=False):
         
-        extra_space_x = 20
-        extra_space_y = 10
         icount = 0
         ocredtext = ''
 
         while icount < len(detectImages):
             detectImage = detectImages[icount]
                     
-            x_new = max(x - extra_space_x, 0)
-            w_new = min(w + 2 * extra_space_x, detectImage.shape[1] - x_new)
-            y_new = max(y - extra_space_y, 0)
-            h_new = min(h + 2 * extra_space_y, detectImage.shape[0] - y_new)
+            x_new = max(x, 0)
+            w_new = w
+            y_new = max(y, 0)
+            h_new = h
             
             # Crop the region of interest asynchronously
             cropped = detectImage[y_new:y_new + h_new, x_new:x_new + w_new]
@@ -591,7 +712,7 @@ class OCRProcessor:
 
             # Perform OCR asynchronously
             ocredtext = await asyncio.to_thread(
-                pytesseract.image_to_string, cropped, lang
+                pytesseract.image_to_string, cropped, lang=lang , config=r'--oem 1 --psm 7'
             )
             ocredtext = ocredtext.strip()
             ocredtext = ocredtext.strip().replace("\n", "")
@@ -618,7 +739,7 @@ class OCRProcessor:
 
                 # Perform OCR asynchronously
                 ocredtext = await asyncio.to_thread(
-                    pytesseract.image_to_string, sharped, lang
+                    pytesseract.image_to_string, sharped,  lang=lang , config=r'--oem 1 --psm 7'
                 )
                 ocredtext = ocredtext.strip()
                 ocredtext = ocredtext.replace("\n", "")
@@ -634,9 +755,9 @@ class OCRProcessor:
         )
 
         if len(ocredtext)<4:
-            return finalImage, False, (x_new, y_new, w_new, h_new)
+            return finalImage, False
 
-        return finalImage, ocredtext , (x_new, y_new, w_new, h_new)
+        return finalImage, ocredtext
     
     async def write_text_to_image(self, image, x, y, w, h, text, font_color=(255, 0, 0)):
 
@@ -672,7 +793,16 @@ class OCRProcessor:
     
     async def direct_extract_text_from_image(self, image):
         # Perform OCR asynchronously on the provided image
-        ocredtext = await asyncio.to_thread(pytesseract.image_to_string, image, lang = "eng+ben")
+        image = cv2.imread(str(image))
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+        # Thresholding
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        
+        # Denoising
+        denoised = cv2.fastNlMeansDenoising(thresh, h=10)
+        
+        ocredtext = await asyncio.to_thread(pytesseract.image_to_string, denoised, lang = "eng+ben", config=r'--oem 1 --psm 6')
         
         # Strip unwanted characters and spaces
         ocredtext = ocredtext.strip()
